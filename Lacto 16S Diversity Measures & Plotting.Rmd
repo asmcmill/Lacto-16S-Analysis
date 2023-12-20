@@ -16,6 +16,7 @@ library(ggpubr)
 library(ggtext)
 library(xlsx)
 library(pairwiseAdonis)
+library(rstatix)
 
 sessionInfo()
 ```
