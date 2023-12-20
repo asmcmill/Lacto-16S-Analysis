@@ -1,0 +1,235 @@
+---
+title: "Diversity Measures"
+author: "Sam McMillan"
+date: "2023-09-21"
+output: html_document
+---
+
+# General setup
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(phyloseq)
+library(ggpubr)
+library(ggtext)
+library(xlsx)
+library(pairwiseAdonis)
+
+sessionInfo()
+```
+
+# Pull in Data
+
+The data includes 16S amplicon reads from mice CDI model 3 types of sample tissues (feces, ileum, and cecum), 4 different times of challenge (day 0, 7, 14, 21), and 4 types of treatments(Cefoperazone only, C. difficile only, L. acidophilus + C. difficile, and L. gasseri + C. difficile). Total 192 samples
+```{r data}
+##Data from Phyloseq
+p<-readRDS("Analysis/Phyloseq.Rds")
+
+#metadata file
+samplekey<-read.csv("Analysis/sample_metadata.csv", row.names=1)%>%
+  as.data.frame()%>%
+  mutate(week=factor(week,levels=c("Week 1","Week 2","Week 3","Week 4")))%>%
+  mutate(treatment=factor(treatment,levels=c("cef","cdiff","la","lg")))
+```
+# Make Diversity Tables using Phyloseq, perform stats 
+Alpha diversity will throw an error here. This is fine as long as we do Simpson or Shannon Diversity per dada2 creator (Dr. Callahan) https://github.com/benjjneb/dada2/issues/214
+```{r Make diversity tables}
+##Turn abundance data into proportion first
+pt<-p%>%
+  transform_sample_counts(function (x) x / sum(x))
+##Alpha diversity, within each sample no need to split
+alpha<-estimate_richness(pt,split=T,measures=c("InvSimpson","Shannon"))%>%
+  rownames_to_column("ID")%>%
+  left_join(., samplekey%>%
+              rownames_to_column("ID"),by="ID")
+
+alphastats<-alpha%>% 
+  mutate(statid=paste(sampletype,week,sep="_"))%>%
+  group_by(statid)%>%
+  summarise(stat=list(pairwise.t.test(InvSimpson,treatment, p.adjust="none")))%>%
+  mutate(stat=map(.$stat,~ as.data.frame(.[["p.value"]])))%>%
+  unnest_longer(stat,names_repair="minimal")%>%
+  remove_rownames()%>%
+  as.matrix()%>%
+  as.data.frame()%>%
+  rename("group1"="stat_id")%>%
+  gather(key="group2",value="p",-statid,-group1)%>%
+  mutate(group2=str_remove(group2,"stat."))%>%
+  separate(statid,into=c("sampletype","week"),sep="_")%>%
+  mutate(p=as.numeric(p))%>%
+  filter(!is.na(p))%>%
+  mutate(p.signif=symnum(p,cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "")))
+
+write.csv(alpha, "Analysis/alpha_diversity.csv",row.names=F)
+write.csv(alphastats,"Analysis/alpha_diversity_t_test.csv",row.names=F)
+
+###Beta Diversity, need to subset by sample type & week first
+betaraw<-NULL
+stress<-NULL
+betastats<-NULL
+for (x in c("feces","cecum","ileum")){
+for (i in c("Week 1",  "Week 2",  "Week 3", "Week 4")){
+psw<-subset_samples(pt,sampletype==x & week==i)
+
+set.seed(25519)
+ord<-ordinate(psw,method="NMDS",distance="bray", trymax = 50, maxit = 5)
+
+betaraw<-rbind(betaraw, ord[["points"]])
+stress<-rbind(stress, cbind(data.frame("sampletype"=x,"week"=i),data.frame("stress"=ord[["stress"]])))
+betastats<-rbind(betastats,pairwise.adonis(distance(psw,method="bray"),sample_data(psw)$treatment,p.adjust.m='fdr')%>%mutate("sampletype"=x,"week"=i))
+}}
+
+beta<-betaraw%>%
+  as_tibble(rownames="ID")%>%
+  left_join(., samplekey%>%
+              rownames_to_column("ID"),by="ID")
+
+write.csv(beta, "Analysis/beta_diversity.csv",row.names=F)
+write.csv(stress, "Analysis/beta_diversity_NMDS_Stress.csv",row.names=F)
+write.csv(betastats, "Analysis/beta_diversity_pairwise_adonis.csv",row.names=F)
+
+```
+# Prism Export
+Export files for use in Graphpad Prism, if necessary.
+
+```{r prism export}
+palpha<-alpha%>%
+  mutate(treatment=factor(treatment,levels=c("cef","cdiff","la","lg")))%>%
+  arrange(mouse,treatment)%>%
+  mutate(ID=paste(treatment,mouse))%>%
+  select(week,sampletype,ID,InvSimpson)%>%
+  spread(key=ID,value=InvSimpson)%>%
+  arrange(sampletype,week)%>%
+  mutate(sample_week=paste(sampletype,week),.after=week)%>%
+  select(-sampletype,-week)
+
+write.xlsx(palpha,file="Analysis/alpha_diversity_Prism.xlsx", sheetName = "InvSimpson",row.names=F)
+write.xlsx(alphastats%>%arrange(sampletype,week),file="Analysis/alpha_diversity_Prism.xlsx", sheetName = "T.test_no.adj",row.names=F,append=T)
+
+pbeta<-beta%>%
+    mutate(treatment=factor(treatment,levels=c("cef","cdiff","la","lg")))%>%
+   select(treatment,week,sampletype,mouse,MDS1,MDS2)%>%
+  spread(key=treatment,value=MDS2)%>%
+  arrange(sampletype,week)
+
+pbetastats<-betastats%>%
+  separate(pairs, into= c("group1","group2"),sep= " vs ")%>%
+  left_join(.,stress,by=c("sampletype","week"))%>%
+  select(sampletype,week,group1,group2,p.value,p.adjusted,stress,everything())%>%
+  arrange(sampletype,week)
+
+for(x in c("feces","cecum","ileum")){
+  for(i in c("Week 1","Week 2","Week 3","Week 4")){
+#Because I use append to add new sheets it will just keep adding sheets every time I re-run this chunk, so lets not append the first time
+    if(x=="feces"&i=="Week 1"){a=FALSE}else{a=TRUE}
+        write.xlsx(pbeta%>%filter(week==i & sampletype==x)%>%select(-week,-sampletype)%>%as.data.frame(),file="Analysis/beta_diversity_Prism.xlsx", sheetName = paste(i,x),append=a, row.names=F)
+  }
+}
+write.xlsx(pbetastats,file="Analysis/beta_diversity_Prism.xlsx", sheetName = "Pairwise.Adonis_Bonferroni",append=T, row.names=F)
+
+
+```
+# Plot the Alpha Diversity
+```{r alphaplots}
+alpha<-read.csv( "Analysis/alpha_diversity.csv")%>%
+  mutate(treatment=factor(treatment,levels=c("cef","cdiff","la","lg")))
+
+ggplot(alpha,aes(x=treatment,y=InvSimpson))+
+  geom_boxplot(outlier.alpha = 0,alpha=0,lwd=0.2)+
+  geom_dotplot(aes(fill=treatment),binaxis="y",stackdir="center",binwidth=2,dotsize=1.5,stackratio=2)+
+  #geom_point(size=2)+
+  #geom_point(color="black",shape=1,size=2)+
+  theme_bw()+
+  labs(y="Alpha diversity (Inverse Simpson)")+
+  scale_x_discrete(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),guide=guide_axis(angle=45))+
+  scale_fill_manual(values=c("#205174","#A5162A","#FCE3E4","#99CEC7"))+
+  facet_wrap(sampletype~week,ncol=4)+
+    theme(legend.position="none",
+          axis.title.x=element_blank(),
+          axis.text.x = element_markdown(),
+        strip.background=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())+
+        stat_pvalue_manual(filter(alphastats,p<0.05), 
+                           label = "p.signif", 
+                           y.position = max(alpha$InvSimpson)*1.1,
+                           step.increase=.2,
+                           step.group.by = c("sampletype","week"))
+
+  
+ggsave("Graphs/Alpha Diversity All.pdf", height=8, width=8, units="in")
+
+for (i in c("cecum","ileum","feces")){
+  data<-alpha%>%filter(sampletype==i)
+  if(i=="cecum"){w=70/45}
+  if(i=="ileum"){w=50/45}
+  if(i=="feces"){w=30/45}
+plot<-ggplot(data,aes(x=treatment,y=InvSimpson))+
+  geom_boxplot(outlier.alpha = 0,alpha=0,lwd=0.2)+
+  geom_dotplot(aes(fill=treatment),binaxis="y",stackdir="center",binwidth=2,dotsize=w,stackratio=2)+
+  theme_bw()+
+  labs(y="Alpha diversity (Inverse Simpson)")+
+  scale_x_discrete(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),guide=guide_axis(angle=45))+
+  scale_fill_manual(values=c("#205174","#A5162A","#FCE3E4","#99CEC7"))+
+  facet_wrap(~week,ncol=2)+
+    theme(legend.position="none",
+          axis.title.x=element_blank(),
+          axis.text.x = element_markdown(),
+        strip.background=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+
+        if(nrow(filter(alphastats,p<0.05 & sampletype==i)>0)){ plot+stat_pvalue_manual(filter(alphastats,p<0.05 & sampletype==i), 
+                           label = "p.signif", 
+                           y.position = max(data$InvSimpson)*1.1,
+                           step.increase=.15,
+                           size=3,
+                           step.group.by = c("sampletype","week"))
+        }else(plot)
+  
+ggsave(paste0("Graphs/Alpha Diversity ", i,".pdf"), height=5, width=5, units="in") 
+}
+```
+# Plot the Beta Diversity
+```{r betaplots}
+
+ggplot(beta,aes(x=MDS1,y=MDS2,color=treatment))+
+  geom_point(size=3)+
+  geom_point(color="black",shape=1,size=3)+
+  #stat_ellipse()+
+  theme_bw()+
+  labs(color="Group")+
+  scale_color_manual(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),
+                    values=c("#205174","#A5162A","#FCE3E4","#99CEC7"))+
+  facet_wrap(sampletype~week,scales="free",ncol=4)+
+    theme(legend.position="bottom",
+          legend.text=element_markdown(),
+        strip.background=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+  
+ggsave("Graphs/Beta Diversity All.pdf", height=8, width=8, units="in")
+
+for (i in c("cecum","feces","ileum")){
+ ggplot(beta%>%filter(sampletype==i),aes(x=MDS1,y=MDS2,color=treatment))+
+  geom_point(size=3)+
+  geom_point(color="black",shape=1,size=3)+
+  #stat_ellipse()+
+  theme_bw()+
+  labs(color="Group")+
+  scale_color_manual(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),
+                    values=c("#205174","#A5162A","#FCE3E4","#99CEC7"))+
+  facet_wrap(~week,scales="free",ncol=2)+
+    theme(legend.position="bottom",
+          legend.text=element_markdown(),
+        strip.background=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())+
+    guides(color=guide_legend(nrow=2))
+  
+ggsave(paste0("Graphs/Beta Diversity ", i,".pdf"), height=5, width=5, units="in") 
+}
+```
+

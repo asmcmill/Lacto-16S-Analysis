@@ -1,0 +1,369 @@
+---
+title: "Lacto 16S ASV level Analysis"
+author: "Sam McMillan"
+date: "2023-09-25"
+output: html_document
+---
+
+# General setup
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(phyloseq)
+library(ggpubr)
+library(ggtext)
+library(xlsx)
+library(Maaslin2)
+library(randomForest)
+library(ALDEx2)
+
+sessionInfo()
+```
+
+# Pull in Data
+The data includes 16S amplicon reads from mice CDI model 3 types of sample tissues (feces, ileum, and cecum), 4 different times of challenge (day 0, 7, 14, 21), and 4 types of treatments(Cefoperazone only, C. difficile only, L. acidophilus + C. difficile, and L. gasseri + C. difficile). Total 192 samples
+```{r data}
+##We're not doing anything in phyloseq so I'm using the data straight out of dada2.
+alldata<-read.csv("Analysis/dada2_alldata_long.csv")%>%
+  mutate(week=factor(week,levels=c("Week 1","Week 2","Week 3","Week 4")))%>%
+  mutate(treatment=factor(treatment,levels=c("cef","cdiff","la","lg")))%>%
+  arrange(week,treatment,sampletype)
+
+ASVinfo<-alldata%>%
+      dplyr::select(Sequence,ASV,Kingdom,Phylum,Class,Order,Family,Genus,Species)%>%
+      unique()
+
+alldata_wide<-alldata%>%
+  mutate(group=paste(treatment,week))%>%
+  mutate(ASV=factor(ASV,levels=c(paste0("ASV",seq(1,691,1)))))%>%
+  dplyr::select(-colnames(ASVinfo)[-2],-count)%>%
+  spread(key=ASV,value=ratio,fill=0)
+
+sampleinfo<-read.csv("Analysis/sample_metadata.csv")
+```
+# ALDEx
+Lets run it as a linear model as we have multiple groups. For this we need two dataframes one with counts and one with sample information
+```{r aldex}
+as<-sampleinfo%>%
+  filter(sampletype=="cecum",week=="Week 3")%>%
+  column_to_rownames("ID")%>%
+  dplyr::select(treatment)%>%
+  mutate(treatment=factor(treatment,levels=c("lg","cef","cdiff","la")))
+
+ad<-alldata%>%
+  filter(sampletype=="cecum",week=="Week 3")%>%
+  mutate(ASV=factor(ASV,levels=c(paste0("ASV",seq(1,691,1)))))%>%
+  dplyr::select(-colnames(ASVinfo)[-2],-ratio)%>%
+  spread(key=ASV,value=count,fill=0)%>%
+  column_to_rownames("ID")%>%
+  dplyr::select(contains("ASV"))%>%
+  t()%>%
+  as.data.frame()%>%
+  dplyr::select(rownames(as))%>%
+  mutate_all(as.integer)
+
+identical(rownames(as),colnames(ad))
+
+mm<-model.matrix(~treatment,as)
+aclr<-aldex.clr(ad,mm,mc.samples=128,denom="all")
+glm<-aldex.glm(aclr)%>%
+  as.data.frame()%>%
+  rownames_to_column("ASV")%>%
+  gather(key="ID",value="value",-ASV)%>%
+  separate(ID,into=c("treatment","type"),sep="\\:\\:|\\:",extra="merge")%>%
+  mutate(treatment=str_remove(treatment,"treatment"))%>%
+  spread(key=type,value=value)
+
+write.csv(glm,"Analysis/aldex_clr_lm.csv",row.names=F)
+
+glmplot<-glm%>%
+  filter(pval.holm<0.05)%>%
+  left_join(.,ASVinfo,by="ASV")%>%
+  mutate(name=paste0(Family," [",ASV,"]"))%>%
+  #filter(name %in% filter(.,treatment=="Intercept")$name)%>% 
+  filter(treatment=="Intercept")%>%
+    arrange(Est)%>%
+  mutate(name=fct_inorder(name))
+
+ggplot(glmplot,aes(x=name,y=Est,size=-log10(pval.holm)))+
+  geom_point()+
+  geom_errorbar(aes(ymin=Est-SE,ymax=Est+SE),linewidth=.5,width=0)+
+  coord_flip()+
+  theme_bw()+
+  labs(y="Intercept",size="-log<sub>10</sub>(Adjusted p value)",color="Treatment")+
+  guides(color=guide_legend(order=1),size=guide_legend(order=2))+
+  theme(axis.text.y=element_text(size=8),
+        axis.title.y=element_blank(),
+        legend.text=element_markdown(),
+        legend.title=element_markdown(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank())#+
+  #scale_color_manual(values=c("#A5162A","#FCE3E4","#99CEC7"), labels=c("*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"))
+ggsave("Graphs/Aldex_CLR_Linear Model_v2.pdf",height=5,width=8,units="in")
+
+glme<-glmplot%>%
+  select(name,treatment,Est)%>%
+  spread(key=treatment,value=Est)
+
+glms<-glmplot%>%
+  select(name,treatment,SE)%>%
+  spread(key=treatment,value=SE)
+
+glmp<-glmplot%>%
+  select(name,treatment,pval.holm)%>%
+  spread(key=treatment,value=pval.holm)
+
+write.xlsx(glme,"Analysis/Aldex Linear Model.xlsx",append=F,sheetName="Estimate")
+write.xlsx(glms,"Analysis/Aldex Linear Model.xlsx",append=T,sheetName="Standard Error")
+write.xlsx(glmp,"Analysis/Aldex Linear Model.xlsx",append=T,sheetName="Holm_adj_p")
+
+```
+
+
+# Species Plots
+```{r}
+specdata<-alldata_wide%>% #start with alldata wide as it has 0s, which we need for the average
+  select(sampletype,treatment,week,contains("ASV"))%>%
+  gather(key="ASV",value="ratio",-sampletype,-treatment,-week)%>%
+  group_by(ASV,sampletype,treatment,week)%>%
+  summarize(mean=mean(ratio))%>%
+  arrange(-mean)%>%
+  left_join(.,ASVinfo,by="ASV")%>%
+  mutate(Phylum=fct_inorder(Phylum)) #rank phylum top to bottom
+
+#find top families
+specfamilies<-specdata%>% 
+  ungroup()%>%
+  select(sampletype,treatment,week,Family)%>%
+  unique()%>%
+  group_by(sampletype,treatment,week)%>%
+  mutate(rank=1:n())%>%
+  filter(rank<=10 & !is.na(Family))%>%
+  mutate(toptype=if_else(rank<=10,sampletype,NA))
+
+#filter top families, replace others with "Other"
+specplot<-specdata%>%
+  mutate(name=if_else(Family %in% specfamilies$Family, Family,"Other"))%>%
+  arrange(Phylum,-mean)%>%
+  mutate(name=factor(name,levels=unique(.$name)))%>%
+  mutate(name=fct_relevel(name, "Other",after=Inf))%>%
+  mutate(Family=if_else(is.na(Family),paste0("NA ",Phylum),Family))%>%
+  mutate(Family=fct_inorder(Family))
+
+#summaries
+specplot%>%
+  ungroup()%>%
+  filter(mean!=0)%>%
+  select(Kingdom,Phylum,Class,Order,Family,Genus,Species,sampletype)%>%
+  group_by(sampletype)%>%
+  summarize_all(list(~n_distinct(.)))%>%
+  t()
+
+specplot%>%
+  ungroup()%>%
+  filter(mean!=0,name!="Other")%>%
+  select(Phylum,name)%>%
+  unique()%>%
+  group_by(Phylum)%>%
+  summarize(n())
+
+# Phylum            `n()`
+# 1 Firmicutes           18
+# 2 Actinobacteriota      7
+# 3 Bacteroidota          6
+# 4 Verrucomicrobiota     1
+# 5 Proteobacteria        8
+
+colors<-specplot%>%
+  ungroup()%>%
+  filter(mean!=0,name!="Other")%>%
+  select(Phylum,name)%>%
+  unique()%>%
+  mutate(namecolors=c(colorRampPalette(c("#FFCC93","#E57900","#7f0000","#FDD6D6"))(18),
+                  colorRampPalette(c("#008000","#CAFCCA"))(7),
+                  colorRampPalette(c("#7800A2","#ECBAFD"))(6),
+                 "yellow2",
+                  colorRampPalette(c("#00008b","#BEBEFC"))(8)))
+                 
+specplot<-left_join(specplot,colors,by=c("Phylum","name"))%>%
+  mutate(namecolors=if_else(is.na(namecolors),"grey",namecolors))%>%
+  arrange(name)
+
+ggplot(specplot,aes(x=treatment,y=mean,fill=name))+
+  geom_bar(stat="identity")+
+  facet_wrap(sampletype~week,ncol=4)+
+  theme_bw()+
+  guides(fill=guide_legend(nrow=31))+
+  scale_fill_manual(values=unique(specplot$namecolors))+
+  theme(strip.background=element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.x=element_markdown(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())+
+  labs(y="Relative Abundance",fill="Family")+
+  scale_y_continuous(expand=c(0,0))+
+  scale_x_discrete(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),guide=guide_axis(angle=45))
+ggsave("Graphs/Family_All.pdf",height=8,width=11,units="in")
+
+for (x in c("feces","cecum","ileum")){
+  
+  data<-specplot%>%
+    filter(sampletype==x)%>%
+    mutate(name=if_else(name %in% (specfamilies%>%filter(toptype==x))$Family,name,"Other"))%>%
+    mutate(name=factor(name,levels=levels(specplot$name)))%>%
+    droplevels()%>%
+    mutate(namecolors=if_else(name=="Other","grey",namecolors))%>%
+    arrange(name)
+
+ ggplot(data,aes(x=treatment,y=mean,fill=name))+
+  geom_bar(stat="identity")+
+  facet_wrap(~week,ncol=2)+
+  theme_bw()+
+  guides(fill=guide_legend(ncol=1))+
+  scale_fill_manual(values=unique(data$namecolors))+
+  theme(strip.background=element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.x=element_markdown(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.box.margin = ggplot2::margin(1.5,0,0,0,unit="cm"))+
+  labs(y="Relative Abundance",fill="Family")+
+   scale_x_discrete(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),guide=guide_axis(angle=45))+
+  scale_y_continuous(expand=c(0,0))
+ggsave(paste0("Graphs/Family_",x,".pdf"),height=8,width=11,units="in") 
+}
+
+#Prism Export
+pspecdata<-specplot%>%
+  ungroup()%>%
+  select(name,treatment,week,sampletype,mean)%>%
+  mutate(treatment=factor(treatment,levels=c("cef","cdiff","la","lg")))%>%
+  group_by(sampletype,week,treatment,name)%>%
+  summarize(mean=mean(mean))%>%
+  spread(key=name,value=mean)%>%
+  ungroup()
+
+
+write.xlsx(ASVinfo%>%select(-Sequence,-ASV)%>%filter(Family %in% specplot$name)%>%unique()%>%as.data.frame(),file="Analysis/stacked families_Prism.xlsx", sheetName = "Taxa key",append=F, row.names=F)
+
+for(x in c("feces","cecum","ileum")){
+  for(i in c("Week 1","Week 2","Week 3","Week 4")){
+#Because I use append to add new sheets it will just keep adding sheets every time I re-run this chunk, so lets not append the first time
+        write.xlsx(pspecdata%>%filter(week==i & sampletype==x)%>%select(-week,-sampletype)%>%as.data.frame(),file="Analysis/stacked families_Prism.xlsx", sheetName = paste(i,x),append=T, row.names=F)
+  }}
+```
+
+# Muribaculaceae & Lactobacilli plots
+```{r}
+muris<-alldata%>%
+  filter(Family=="Muribaculaceae"&sampletype=="cecum")%>%
+  mutate(ASV=fct_inorder(ASV),mouse=factor(mouse, levels=c(1,2,3,4)))%>%
+  select(treatment,ratio,ASV,week,mouse)%>%
+  complete(treatment,ASV,week,mouse,fill=list(ratio=0))
+  
+
+ggplot(muris,aes(x=treatment,y=ratio*100))+
+  geom_boxplot(outlier.alpha = 0,alpha=0,lwd=0.2)+
+  geom_dotplot(aes(fill=treatment),binaxis="y",stackdir="center",binwidth=2,dotsize=15/22,stackratio=2)+
+  #geom_point(size=2)+
+  #geom_point(color="black",shape=1,size=2)+
+  theme_bw()+
+  labs(y="Relative Abundance (%)")+
+  scale_x_discrete(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),guide=guide_axis(angle=45))+
+  scale_fill_manual(values=c("#205174","#A5162A","#FCE3E4","#99CEC7"))+
+  facet_grid(ASV~week)+
+    theme(legend.position="none",
+          axis.title.x=element_blank(),
+          axis.text.x = element_markdown(),
+        strip.background=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+ggsave(paste0("Graphs/All Muribaculaceae reads.pdf"),height=8,width=11,units="in") 
+
+ggplot(muris,aes(x=treatment,y=log10(ratio*100)))+
+  geom_boxplot(outlier.alpha = 0,alpha=0,lwd=0.2)+
+  geom_dotplot(aes(fill=treatment),binaxis="y",stackdir="center",binwidth=2,dotsize=4/22,stackratio=2)+
+  #geom_point(size=2)+
+  #geom_point(color="black",shape=1,size=2)+
+  theme_bw()+
+  labs(y="log<sub>10</sub>(% Relative Abundance)")+
+  scale_x_discrete(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),guide=guide_axis(angle=45))+
+  scale_fill_manual(values=c("#205174","#A5162A","#FCE3E4","#99CEC7"))+
+  facet_grid(ASV~week)+
+    theme(legend.position="none",
+          axis.title.x=element_blank(),
+          axis.title.y=element_markdown(),
+          axis.text.x = element_markdown(),
+        strip.background=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+ggsave(paste0("Graphs/All Muribaculaceae reads_log10.pdf"),height=8,width=11,units="in") 
+
+
+
+lactos<-alldata%>%
+  filter(Family=="Lactobacillaceae"&sampletype=="cecum")%>%
+  mutate(ASV=fct_inorder(ASV),mouse=factor(mouse, levels=c(1,2,3,4)))%>%
+  select(treatment,ratio,ASV,week,mouse)%>%
+  complete(treatment,ASV,week,mouse,fill=list(ratio=0))
+  
+
+ggplot(lactos,aes(x=treatment,y=ratio*100))+
+  geom_boxplot(outlier.alpha = 0,alpha=0,lwd=0.2)+
+  geom_dotplot(aes(fill=treatment),binaxis="y",stackdir="center",binwidth=2,dotsize=8/32,stackratio=2)+
+  #geom_point(size=2)+
+  #geom_point(color="black",shape=1,size=2)+
+  theme_bw()+
+  labs(y="Relative Abundance (%)")+
+  scale_x_discrete(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),guide=guide_axis(angle=45))+
+  scale_fill_manual(values=c("#205174","#A5162A","#FCE3E4","#99CEC7"))+
+  facet_grid(ASV~week)+
+    theme(legend.position="none",
+          axis.title.x=element_blank(),
+          axis.text.x = element_markdown(),
+        strip.background=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+ggsave(paste0("Graphs/All Lactobacillaceae reads.pdf"),height=8,width=11,units="in") 
+
+ggplot(lactos,aes(x=treatment,y=log10(ratio*100)))+
+  geom_boxplot(outlier.alpha = 0,alpha=0,lwd=0.2)+
+  geom_dotplot(aes(fill=treatment),binaxis="y",stackdir="center",binwidth=2,dotsize=3/32,stackratio=2)+
+  #geom_point(size=2)+
+  #geom_point(color="black",shape=1,size=2)+
+  theme_bw()+
+  labs(y="log<sub>10</sub>(% Relative Abundance)")+
+  scale_x_discrete(labels=c("Cefoperazone Only","*C. difficile* Only","*L. acidophilus* + *C. difficile*","*L. gasseri* + *C. difficile*"),guide=guide_axis(angle=45))+
+  scale_fill_manual(values=c("#205174","#A5162A","#FCE3E4","#99CEC7"))+
+  facet_grid(ASV~week)+
+    theme(legend.position="none",
+          axis.title.x=element_blank(),
+          axis.title.y=element_markdown(),
+          axis.text.x = element_markdown(),
+        strip.background=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+ggsave(paste0("Graphs/All Lactobacillaceae reads_log10.pdf"),height=8,width=11,units="in") 
+
+
+murisprism<-muris%>%
+             mutate(ID=paste0(treatment,mouse))%>%
+             select(-treatment,-mouse)%>%
+            group_by(week)%>%
+             spread(key=ID,value=ratio)
+
+lactosprism<-lactos%>%
+             mutate(ID=paste0(treatment,mouse))%>%
+             select(-treatment,-mouse)%>%
+            group_by(week)%>%
+             spread(key=ID,value=ratio)
+
+write.xlsx(murisprism%>%as.data.frame(),file="Analysis/Muribaculaceae relative abundance.xlsx")
+
+write.xlsx(lactosprism%>%as.data.frame(),"Analysis/Lactobacillaceae relative abundance.xlsx")
+
+write.xlsx(ASVinfo%>%as.data.frame(),"Analysis/ASV information.xlsx")
+```
+

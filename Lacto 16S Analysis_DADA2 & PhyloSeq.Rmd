@@ -1,0 +1,198 @@
+---
+title: "Lactobacillus 16s Analysis"
+author: "Sam McMillan"
+date: "2023-09-14"
+output: html_document
+---
+
+# Knit options and Packages
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(dada2)
+library(phyloseq)
+
+sessionInfo()
+```
+# Find Samples for Dada2
+The data includes 16S amplicon reads from mice CDI model 3 types of sample tissues (feces, ileum, and cecum), 4 different times of challenge (day 0, 7, 14, 21), and 4 types of treatments(Cefoperazone only, C. difficile only, L. acidophilus + C. difficile, and L. gasseri + C. difficile). Total 192 samples (Forward and Reverse for each: 384 reads)
+
+files are found on Google Drive, I'm using google drive sync to access the files
+
+Filenames are: [cage]-[mouse]-[challenge day]-[treatment]-[sample tissue]_[SeqInfo (Not important)]_L001_[(R1=Forward,R2=Reverse)]_001.fastq.gz
+
+treatments:
+  Cefoperazone only=No 
+  C. difficile only=Cd
+  L. acidophilus + C. difficile=La
+  L. gasseri + C. difficile=Lg
+  
+sample tissue:
+  feces=fe, ileum=il, and cecum=ce
+
+```{r read files & get info, include=T}
+#files are found on Google Drive, I'm using google drive sync to access the files
+path<-"Q:/.shortcut-targets-by-id/0BwNUpRTHaLxFaVZDZURmVTZsSXc/Theriot Lab/2. Data Dump/Rajani/Computer Files/Lacto_16S/Data/reads"
+
+#split forward and reverse, make sure they're in the right order
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq.gz", full.names = TRUE))
+
+#cut everything after the "_" to get just the names
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+#quick check
+fnFs[[1]]; fnRs[[1]]
+sample(sample.names,10)
+```
+# Read Quality Check
+Lets check the read quality. This takes a bit too long to do all the samples, so lets random sample 5.
+```{r Quality Profile}
+set.seed(25519)
+plotQualityProfile(sample(fnFs,5),aggregate=TRUE)
+set.seed(25519)
+plotQualityProfile(sample(fnRs,5),aggregate=TRUE)
+
+```
+# Filter Low Quality Reads
+
+Based on quality profiles, I'll set the following cutoffs
+Forward reads: 240 (Rajani did 250, but dada tutorial recommends cutting at least the last 10)
+Reverse Reads 150
+So we will truncate at those numbers. Lets filter.
+
+dada tutorial recommends standard filtering parameters: maxN=0 (DADA2 requires no Ns), truncQ=2, rm.phix=TRUE and maxEE=2. The maxEE parameter sets the maximum number of “expected errors” allowed in a read, which is a better filter than simply averaging quality scores.
+rm.phix removes reads that match the phiX genome.phiX is a common phage contaminant
+
+```{r filter}
+path2<-'Q:/My Drive/Lab Work/Data/Lacto 16S'
+filtFs <- file.path(path2, "Analysis/filtered reads", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path2, "Analysis/filtered reads", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,150),
+              maxN=0, maxEE=c(2,2),truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=FALSE) # On Mac set multithread=TRUE
+
+head(out)
+```
+# Check Error Rates
+Next, lets check the error rates
+```{r error rates}
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+```
+The red line above is the "error rates expected under the nominal defintion of the Q-score". Here we are checking that the black line is decreasing as quality increases. We also want to make sure that black line properly reflects the points.
+
+This looks good for the forward and reverse, we're OK with this error rate calculation.
+
+# dada2 sample inference
+Next we'll move onto the sample inference. This is what makes dada2 so great in that it corrects errors. 
+```{r dada}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+
+#take a peek
+dadaFs[[1]]
+head(getSequences(dadaFs[[1]]))
+```
+# Merge Paired end reads
+Next we need to merge the paired ends
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+head(mergers[[1]])
+
+```
+# Construct Sequence Table
+Construct sequence table & check if our read lengths are ~250
+```{r}
+seqtab <- makeSequenceTable(mergers)
+
+paste0(dim(seqtab)[1]," Samples and ",dim(seqtab)[2]," reads")
+
+table(nchar(getSequences(seqtab)))
+```
+
+# Chimera Removal
+dada2 corrects for substitutions and indels, but we still have chimeras. lets get rid of those. 
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+
+paste0(dim(seqtab.nochim)[1]," Samples and ",dim(seqtab.nochim)[2]," ASVs after chimera removal")
+
+paste0(sum(seqtab.nochim)/sum(seqtab)*100," percent of reads are left after chimera removal")
+```
+So there were quite a few chimeras, but they were low in abundance, so not a big deal.
+
+# Quick Sanity Check
+sanity check to make sure our filtering is working
+```{r sanity check}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), 
+sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+```
+
+# Assign Taxonomy to ASV
+Assign Taxonomy. This requires a database that dada2 upkeeps. This is version 138.1
+https://benjjneb.github.io/dada2/training.html
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, paste0(path2,"/Analysis/tax_dbs/silva_nr99_v138.1_train_set.fa.gz"), multithread=TRUE)
+taxa <- addSpecies(taxa, paste0(path2,"/Analysis/tax_dbs/silva_species_assignment_v138.1.fa.gz"), allowMultiple = TRUE, n = 1000)
+```
+
+# Import into PhyloSeq
+lets get the metadata (I cleaned this from Rajani's, made everything lowercase)
+```{r}
+samplekey<-read.csv("Analysis/sample_metadata.csv", row.names=1)%>%
+  as.data.frame()%>%
+  mutate(week=factor(week,levels=c("Week 1","Week 2","Week 3","Week 4")))%>%
+  mutate(treatment=factor(treatment,levels=c("cef","cdiff","la","lg")))
+```
+Make the Phyloseq Object
+```{r}
+#seqtab.nochim<-read.csv("Analysis/dada2_sequence-table-no-chimeras.csv",row.names=1,check.names=F)%>%as.matrix()
+#taxa<-read.csv("Analysis/dada2_taxonomy-for-sequences.csv",row.names=1,check.names=F)%>%as.matrix()
+ps<-phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE),
+             sample_data(samplekey),
+             tax_table(taxa))
+
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+
+saveRDS(ps, "Analysis/Phyloseq.Rds")
+```
+# Export dada2 tables
+Lets make a rich csv file of dada2 & save the other important stuff from dada2 too.
+```{r}
+alldata<-seqtab.nochim%>%
+  t()%>%
+  as.data.frame()%>%
+  rownames_to_column("Sequence")%>%
+  left_join(.,taxa%>%
+              as.data.frame()%>%
+               rownames_to_column("Sequence"),
+            by="Sequence")%>%
+  select(Sequence, Kingdom,Phylum,Class,Order,Family,Genus,Species,everything())%>%
+  mutate(ASV=paste0("ASV",1:n()),.after="Sequence")%>%
+  gather(key="ID",value="count",-Sequence,-ASV,-Kingdom,-Phylum,-Class,-Order,-Family,-Genus,-Species)%>%
+  filter(count!=0)%>%
+  group_by(ID)%>%
+  mutate(ratio=count/sum(count))%>%
+  left_join(.,samplekey%>%rownames_to_column("ID"),by="ID")
+
+write.csv(alldata,"Analysis/dada2_alldata_long.csv",row.names=F)
+write.csv(seqtab.nochim, "Analysis/dada2_sequence-table-no-chimeras.csv")
+write.csv(taxa, "Analysis/dada2_taxonomy-for-sequences.csv")
+```
+
