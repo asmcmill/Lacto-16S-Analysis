@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+desktop.ini
+**/desktop.ini
+Background Info/
+Analysis/filtered reads/
+Analysis/tax_dbs/
